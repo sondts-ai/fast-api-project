@@ -47,7 +47,7 @@ def may_chem_van_phong(text: str) -> str:
     return text[0].upper() + text[1:] if text else text
 
 class CRAG:
-    def __init__(self, threshold: float = 0.6):
+    def __init__(self, threshold: float = 0.75):
         self.threshold = threshold
 
     def get_chain(self, vector_store: PGVector):
