@@ -175,7 +175,7 @@ class CRAG:
         def refuse_node(state: GraphState):
             print("[REFUSE] Không có thông tin phù hợp")
             return {
-                "generation": "Tôi không có thông tin về vấn đề này."
+                "generation": "Tôi không biết, tôi không có thông tin về nó và không trả lời thêm thông tin nào khác."
             }
 
         # Conditional edge

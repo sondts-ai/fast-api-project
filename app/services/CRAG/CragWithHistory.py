@@ -2,7 +2,7 @@ import re
 import os
 from typing import Any
 from langchain_core.runnables import RunnableLambda
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_postgres import PGVector
 from langchain_ollama import ChatOllama
@@ -46,35 +46,60 @@ def may_chem_van_phong(text: str) -> str:
 
 
 class CRAGWithHistory:
-    def __init__(self, threshold: float = 0.75):
-        self.threshold = threshold
+    def __init__(self):
+        pass
 
     def get_chain(self, vector_store: PGVector):
         async def retrieve_node(state: GraphState):
             question = state["question"]
             print(f"\n[RETRIEVE] Tìm kiếm: '{question}'")
 
-            docs_with_scores = await vector_store.asimilarity_search_with_relevance_scores(question, k=3)
-            documents = [doc for doc, _ in docs_with_scores]
-            scores = [score for _, score in docs_with_scores]
-
-            for doc, score in docs_with_scores:
-                print(f"  score={score:.3f} | {doc.page_content[:60]}...")
+            documents = await vector_store.amax_marginal_relevance_search(
+                question, k=3, fetch_k=10
+            )
 
             return {
                 "documents": documents,
-                "scores": scores,
+                "scores": [1.0] * len(documents),
                 "question": question,
                 "chat_history": state.get("chat_history", []),
                 "retry_count": state.get("retry_count", 0),
             }
 
-        def grade_node(state: GraphState):
+        async def grade_node(state: GraphState):
             documents = state["documents"]
-            scores = state["scores"]
-            relevant_docs = [doc for doc, score in zip(documents, scores) if score > self.threshold]
+            question = state["question"]
+            prompt = PromptTemplate(
+                template=(
+                    "Bạn là một trợ lý kiểm tra dữ liệu. Hãy xem tài liệu có chứa thông tin để trả lời câu hỏi hay không.\n"
+                    "Chỉ trả lời \"yes\" hoặc \"no\". Không giải thích gì thêm.\n\n"
+                    "Ví dụ 1:\n"
+                    "TÀI LIỆU: Hồ Gươm nằm ở trung tâm thủ đô Hà Nội.\n"
+                    "CÂU HỎI: Hồ Gươm ở đâu?\n"
+                    "TRẢ LỜI: yes\n\n"
+                    "Ví dụ 2:\n"
+                    "TÀI LIỆU: Phở là món ăn truyền thống của Việt Nam.\n"
+                    "CÂU HỎI: Ai là người xây dựng Văn Miếu?\n"
+                    "TRẢ LỜI: no\n\n"
+                    "Bây giờ đến lượt bạn:\n"
+                    "TÀI LIỆU: {document}\n"
+                    "CÂU HỎI: {question}\n"
+                    "TRẢ LỜI:"
+                ),
+                input_variables=["document", "question"],
+            )
+            grader_chain = prompt | llm | StrOutputParser()
+            relevant_docs = []
+            for doc in documents:
+                score_response = await grader_chain.ainvoke({
+                    "question": question,
+                    "document": doc.page_content,
+                })
+                if "yes" in score_response.strip().lower():
+                    relevant_docs.append(doc)
+
             fallback = len(relevant_docs) == 0
-            print(f"[GRADE] {len(relevant_docs)}/{len(documents)} docs vượt threshold {self.threshold}")
+            print(f"[GRADE] LLM lọc giữ lại {len(relevant_docs)}/{len(documents)} docs")
 
             return {
                 "documents": relevant_docs,
@@ -84,38 +109,27 @@ class CRAGWithHistory:
 
         async def rewrite_node(state: GraphState):
             question = state["question"]
-            documents = state["documents"]
             retry_count = state.get("retry_count", 0) + 1
 
             print(f"[REWRITE] Viết lại câu hỏi (retry={retry_count})")
-            context = "\n\n".join(doc.page_content for doc in documents) if documents else ""
 
             prompt = ChatPromptTemplate.from_messages([
-                ("system",
-                 "Bạn là người viết lại câu hỏi để tối ưu truy hồi dữ liệu.\n"
-                 "Chỉ dùng thực thể và địa danh có trong <ngu_canh>.\n"
-                 "Nếu không đủ thông tin, giữ nguyên câu hỏi gốc."),
-                ("human",
-                 "<ngu_canh>\n{context}\n</ngu_canh>\n"
-                 "Câu hỏi gốc: {question}\n"
-                 "Viết lại ngắn gọn, rõ ý:"),
+                ("system", "Hãy trích xuất từ khóa quan trọng nhất từ câu hỏi dưới đây để tìm kiếm. Chỉ in ra từ khóa, không in gì thêm."),
+                ("human", "Câu hỏi gốc: {question}\nTừ khóa:"),
             ])
             chain = prompt | llm | StrOutputParser()
-            rewritten = await chain.ainvoke({
-                "question": question,
-                "context": context,
-            })
+            rewritten = await chain.ainvoke({"question": question})
             rewritten = rewritten.strip() or question
-            print(f"[REWRITE] '{question}' → '{rewritten}'")
+            print(f"[REWRITE] '{question}' → Keyword: '{rewritten}'")
 
-            docs_with_scores = await vector_store.asimilarity_search_with_relevance_scores(rewritten, k=3)
-            new_documents = [doc for doc, _ in docs_with_scores]
-            new_scores = [score for _, score in docs_with_scores]
+            new_documents = await vector_store.amax_marginal_relevance_search(
+                rewritten, k=3, fetch_k=10
+            )
 
             return {
                 "question": rewritten,
                 "documents": new_documents,
-                "scores": new_scores,
+                "scores": [1.0] * len(new_documents),
                 "chat_history": state.get("chat_history", []),
                 "retry_count": retry_count,
             }
@@ -132,10 +146,14 @@ class CRAGWithHistory:
 
             prompt = ChatPromptTemplate.from_messages([
                 ("system",
-                 "Bạn là NPC hướng dẫn viên du lịch ảo tại Hà Nội.\n"
-                 "Chỉ trả lời dựa trên <ngu_canh> bên dưới.\n"
-                 "TUYỆT ĐỐI không tự bịa thêm thông tin.\n\n"
-                 "<ngu_canh>\n{context}\n</ngu_canh>"),
+                 "Bạn là một NPC hướng dẫn viên du lịch ảo nhiệt tình, am hiểu sâu sắc về văn hóa, lịch sử và địa danh Hà Nội.\n"
+                 "Nhiệm vụ của bạn là giải đáp thắc mắc cho du khách một cách tự nhiên dựa trên <ngu_canh> dưới đây.\n"
+                 "Bạn được phép dùng <chat_history> để hiểu ngữ cảnh hội thoại.\n\n"
+                 "<ngu_canh>\n{context}\n</ngu_canh>\n\n"
+                 "Hướng dẫn trả lời:\n"
+                 "- Hãy trả lời ngắn gọn, lịch sự và chính xác những gì có trong <ngu_canh>.\n"
+                 "- TUYỆT ĐỐI KHÔNG tự ý suy diễn hay bịa đặt thông tin không có trong <ngu_canh>.\n"
+                 "- Nếu <ngu_canh> không có thông tin, bạn BẮT BUỘC trả lời: 'Tôi không biết, tôi không có thông tin về nó và không trả lời thêm thông tin nào khác'."),
                 MessagesPlaceholder(variable_name="chat_history"),
                 ("human", "{question}"),
             ])
@@ -151,7 +169,7 @@ class CRAGWithHistory:
 
         def refuse_node(state: GraphState):
             print("[REFUSE] Không có thông tin phù hợp")
-            return {"generation": "Tôi không có thông tin về vấn đề này."}
+            return {"generation": "Tôi không biết, tôi không có thông tin về nó và không trả lời thêm thông tin nào khác."}
 
         def decide(state: GraphState):
             if not state["fallback"]:
