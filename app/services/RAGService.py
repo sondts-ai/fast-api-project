@@ -71,8 +71,8 @@ class RagService:
             return self._retriever_cache[collection_name]
         vector = await self.get_vector_store(collection_name)
         retriever = vector.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 3}
+            search_type="mmr",
+            search_kwargs={"k": 3, "fetch_k": 10}
         )
         self._retriever_cache[collection_name] = retriever
         return retriever
